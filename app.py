@@ -71,7 +71,7 @@ def render_upload_tab() -> None:
         return
 
     key = f"uploader_{st.session_state.get('uploader_key', 0)}"
-    uploaded = st.file_uploader("Upload a CSV or PDF", type=["csv", "pdf"], key=key)
+    uploaded = st.file_uploader("Upload a CSV, PDF, or TXT", type=["csv", "pdf", "txt"], key=key)
     if uploaded is None:
         return
 

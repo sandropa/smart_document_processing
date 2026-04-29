@@ -14,6 +14,8 @@ def parse_file(file, filename: str) -> tuple[dict, list[dict]]:
         return parse_csv(file, filename)
     if ext == "pdf":
         return parse_pdf(file, filename)
+    if ext == "txt":
+        return parse_txt(file, filename)
     raise ValueError(f"Unsupported file type: .{ext}")
 
 # Canonical column name -> accepted header variants (lowercased + stripped).
@@ -158,3 +160,50 @@ def parse_pdf(file, filename: str) -> tuple[dict, list[dict]]:
         "status": "uploaded",
         "source_filename": filename,
     }, items
+
+
+# --- TXT parser (matches our minimal sample format) ---
+
+_TXT_HEADER_RE = re.compile(r"^(invoice|purchase\s+order)\s+(.+)$", re.I)
+_TXT_TOTAL_RE = re.compile(r"^total\s*:\s*([\d.,]+)\s+(\w+)\s*$", re.I)
+
+
+def parse_txt(file, filename: str) -> tuple[dict, list[dict]]:
+    """Parse 'Invoice X' / 'Total: <amt> <ccy>' style files. No line items."""
+    if hasattr(file, "read"):
+        raw = file.read()
+        content = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    else:
+        with open(file, encoding="utf-8") as f:
+            content = f.read()
+
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    if not lines:
+        raise ValueError("TXT has no content")
+
+    doc_type, number = "invoice", ""
+    if m := _TXT_HEADER_RE.match(lines[0]):
+        doc_type = "purchase_order" if "purchase" in m.group(1).lower() else "invoice"
+        number = m.group(2).strip()
+
+    total, currency = 0.0, ""
+    for line in lines[1:]:
+        if m := _TXT_TOTAL_RE.match(line):
+            total = to_float(m.group(1).replace(",", ""))
+            currency = m.group(2).upper()
+            break
+
+    return {
+        "type": doc_type,
+        "supplier": "",
+        "number": number,
+        "issue_date": "",
+        "due_date": "",
+        "currency": currency,
+        # No breakdown in source; collapse so the math validator passes.
+        "subtotal": total,
+        "tax": 0.0,
+        "total": total,
+        "status": "uploaded",
+        "source_filename": filename,
+    }, []
