@@ -14,6 +14,27 @@ from db import (
     update_document,
 )
 from parsing import parse_csv
+from validators import has_errors, validate
+
+
+def _status_for(issues: list[dict]) -> str:
+    return "needs_review" if has_errors(issues) else "validated"
+
+
+def render_issues(issues: list[dict]) -> None:
+    if not issues:
+        st.success("No validation issues.")
+        return
+    errors = [i for i in issues if i["severity"] == "error"]
+    warnings = [i for i in issues if i["severity"] == "warning"]
+    if errors:
+        st.error(f"{len(errors)} error(s)")
+        for i in errors:
+            st.markdown(f"- **{i['field']}** — {i['message']}")
+    if warnings:
+        st.warning(f"{len(warnings)} warning(s)")
+        for i in warnings:
+            st.markdown(f"- **{i['field']}** — {i['message']}")
 
 
 def render_upload_tab() -> None:
@@ -47,7 +68,13 @@ def render_upload_tab() -> None:
     st.write("**Preview**")
     st.json(doc)
     st.dataframe(pd.DataFrame(items), use_container_width=True)
+
+    issues = validate(doc, items)
+    st.write("**Validation**")
+    render_issues(issues)
+
     if st.button("Save to database", type="primary"):
+        doc["status"] = _status_for(issues)
         st.session_state["saved_doc_id"] = insert_document(doc, items)
         st.rerun()
 
@@ -71,6 +98,9 @@ def render_detail_tab() -> None:
     doc = get_document(selected)
     if not doc:
         return
+
+    st.write("**Validation**")
+    render_issues(validate(doc, doc["items"]))
 
     with st.form("edit_doc"):
         c1, c2, c3 = st.columns(3)
@@ -104,8 +134,13 @@ def render_detail_tab() -> None:
         )
 
         if st.form_submit_button("Save changes", type="primary"):
-            update_document(selected, doc, items_df.to_dict(orient="records"))
-            st.success("Saved.")
+            new_items = items_df.to_dict(orient="records")
+            issues = validate(doc, new_items)
+            # Re-validate: auto-flip between needs_review/validated unless user chose rejected.
+            if doc["status"] != "rejected":
+                doc["status"] = _status_for(issues)
+            update_document(selected, doc, new_items)
+            st.success(f"Saved. Status: {doc['status']}.")
 
 
 st.set_page_config(page_title="Smart Document Processing", layout="wide")
