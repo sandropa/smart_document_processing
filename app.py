@@ -13,7 +13,7 @@ from db import (
     to_float,
     update_document,
 )
-from parsing import parse_csv
+from parsing import parse_file
 from validators import has_errors, validate
 
 
@@ -66,12 +66,12 @@ def render_upload_tab() -> None:
         return
 
     key = f"uploader_{st.session_state.get('uploader_key', 0)}"
-    uploaded = st.file_uploader("Upload a CSV", type=["csv"], key=key)
+    uploaded = st.file_uploader("Upload a CSV or PDF", type=["csv", "pdf"], key=key)
     if uploaded is None:
         return
 
     try:
-        doc, items = parse_csv(uploaded, uploaded.name)
+        doc, items = parse_file(uploaded, uploaded.name)
     except ValueError as e:
         st.error(f"Could not parse `{uploaded.name}`: {e}")
         return
