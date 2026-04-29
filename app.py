@@ -21,6 +21,20 @@ def _status_for(issues: list[dict]) -> str:
     return "needs_review" if has_errors(issues) else "validated"
 
 
+def _docs_with_issue_counts() -> pd.DataFrame:
+    """List docs + a count of error-severity issues per row."""
+    docs = list_documents()
+    if docs.empty:
+        return docs
+    counts = []
+    for doc_id in docs["id"]:
+        full = get_document(int(doc_id))
+        issues = validate(full, full["items"]) if full else []
+        counts.append(sum(1 for i in issues if i["severity"] == "error"))
+    docs.insert(len(docs.columns) - 1, "issues", counts)
+    return docs
+
+
 def render_issues(issues: list[dict]) -> None:
     if not issues:
         st.success("No validation issues.")
@@ -80,17 +94,40 @@ def render_upload_tab() -> None:
 
 
 def render_dashboard_tab() -> None:
-    docs = list_documents()
+    docs = _docs_with_issue_counts()
     if docs.empty:
         st.info("No documents yet.")
-    else:
-        st.dataframe(docs, use_container_width=True, hide_index=True)
+        return
+    status_filter = st.selectbox(
+        "Filter by status", ["all", *STATUSES], index=0, key="dash_status_filter",
+    )
+    if status_filter != "all":
+        docs = docs[docs["status"] == status_filter]
+    st.dataframe(docs, use_container_width=True, hide_index=True)
 
 
 def render_detail_tab() -> None:
+    # Toast carried over from the previous run (after save + rerun).
+    msg = st.session_state.pop("detail_save_msg", None)
+    if msg:
+        st.success(msg)
+
     docs = list_documents()
     if docs.empty:
         st.info("Upload something first.")
+        return
+
+    # Default to needs_review when any exist, so this tab acts as a review queue.
+    options = ["all", *STATUSES]
+    has_review = (docs["status"] == "needs_review").any()
+    default_idx = options.index("needs_review") if has_review else 0
+    status_filter = st.selectbox(
+        "Filter by status", options, index=default_idx, key="detail_status_filter",
+    )
+    if status_filter != "all":
+        docs = docs[docs["status"] == status_filter]
+    if docs.empty:
+        st.info(f"No documents with status `{status_filter}`.")
         return
 
     ids = docs["id"].tolist()
@@ -98,9 +135,6 @@ def render_detail_tab() -> None:
     doc = get_document(selected)
     if not doc:
         return
-
-    st.write("**Validation**")
-    render_issues(validate(doc, doc["items"]))
 
     with st.form("edit_doc"):
         c1, c2, c3 = st.columns(3)
@@ -133,14 +167,29 @@ def render_detail_tab() -> None:
             use_container_width=True,
         )
 
-        if st.form_submit_button("Save changes", type="primary"):
-            new_items = items_df.to_dict(orient="records")
-            issues = validate(doc, new_items)
-            # Re-validate: auto-flip between needs_review/validated unless user chose rejected.
-            if doc["status"] != "rejected":
-                doc["status"] = _status_for(issues)
-            update_document(selected, doc, new_items)
-            st.success(f"Saved. Status: {doc['status']}.")
+        b1, b2 = st.columns(2)
+        validate_clicked = b1.form_submit_button("Validate")
+        save_clicked = b2.form_submit_button("Save changes", type="primary")
+
+    # Read form values whether or not a button was clicked (initial render uses DB state).
+    new_items = items_df.to_dict(orient="records")
+    issues = validate(doc, new_items)
+
+    if save_clicked:
+        if doc["status"] != "rejected":
+            doc["status"] = _status_for(issues)
+        update_document(selected, doc, new_items)
+        st.session_state["detail_save_msg"] = f"Saved. Status: {doc['status']}."
+        st.rerun()
+
+    if validate_clicked and not has_errors(issues) and doc["status"] != "rejected":
+        doc["status"] = "validated"
+        update_document(selected, doc, new_items)
+        st.session_state["detail_save_msg"] = "Validation passed — status set to validated."
+        st.rerun()
+
+    st.write("**Validation**")
+    render_issues(issues)
 
 
 st.set_page_config(page_title="Smart Document Processing", layout="wide")
