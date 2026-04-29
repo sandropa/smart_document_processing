@@ -1,5 +1,6 @@
 """Document parsers."""
 import base64
+import json
 import re
 
 import pandas as pd
@@ -10,12 +11,14 @@ from db import to_float
 
 IMAGE_EXTS = ("png", "jpg", "jpeg")
 OPENROUTER_OCR_MODEL = "baidu/qianfan-ocr-fast:free"
+OPENROUTER_VISION_MODEL = "google/gemini-2.5-flash"
 
 
 def parse_file(
     file,
     filename: str,
     api_key: str | None = None,
+    on_status=None,
 ) -> tuple[dict, list[dict]]:
     """Dispatch to the right parser by filename extension."""
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
@@ -26,7 +29,7 @@ def parse_file(
     if ext == "txt":
         return parse_txt(file, filename)
     if ext in IMAGE_EXTS:
-        return parse_image(file, filename, api_key or "")
+        return parse_image(file, filename, api_key or "", on_status=on_status)
     raise ValueError(f"Unsupported file type: .{ext}")
 
 # Canonical column name -> accepted header variants (lowercased + stripped).
@@ -232,13 +235,117 @@ def parse_txt(file, filename: str) -> tuple[dict, list[dict]]:
     return _parse_minimal_text(content, filename)
 
 
-# --- Image parser via OpenRouter OCR ---
+# --- Image parser via OpenRouter ---
 
 _MIME_BY_EXT = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
 
+_OCR_PROMPT = (
+    "Extract every line of visible text from this image, exactly as written, "
+    "one per line. Do not add commentary, headers, or formatting."
+)
 
-def parse_image(file, filename: str, api_key: str) -> tuple[dict, list[dict]]:
-    """Send the image to OpenRouter for OCR, then parse the returned text."""
+_JSON_EXTRACT_PROMPT = """Extract the document data from this image and return ONLY a JSON object with exactly these fields:
+{
+  "type": "invoice" or "purchase_order",
+  "supplier": string,
+  "number": string,
+  "issue_date": "YYYY-MM-DD" or "",
+  "due_date": "YYYY-MM-DD" or "",
+  "currency": 3-letter ISO code (e.g. USD, EUR, GBP) or "",
+  "subtotal": number,
+  "tax": number,
+  "total": number,
+  "items": [{"description": string, "qty": number, "price": number, "total": number}]
+}
+Use 0 for missing numbers and "" for missing strings. Convert any date to ISO format. Return only the JSON object — no markdown, no commentary."""
+
+
+def _call_openrouter_vision(model: str, image_bytes: bytes, mime: str,
+                            prompt: str, api_key: str, want_json: bool = False) -> str:
+    """POST one chat-completion with an image attached. Return the message content."""
+    data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
+    body: dict = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }],
+    }
+    if want_json:
+        body["response_format"] = {"type": "json_object"}
+
+    resp = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"] or ""
+
+
+def _strip_json_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```\s*$", "", text)
+    return text
+
+
+def _is_extraction_incomplete(doc: dict) -> bool:
+    """Cheap-path failure heuristic: missing any of number / total / currency."""
+    return (
+        not str(doc.get("number") or "").strip()
+        or to_float(doc.get("total")) <= 0
+        or not str(doc.get("currency") or "").strip()
+    )
+
+
+def _doc_from_json(data: dict, filename: str) -> tuple[dict, list[dict]]:
+    items = [
+        {
+            "description": str(it.get("description") or ""),
+            "qty": to_float(it.get("qty")),
+            "price": to_float(it.get("price")),
+            "total": to_float(it.get("total")),
+        }
+        for it in (data.get("items") or [])
+    ]
+    raw_type = str(data.get("type") or "").lower()
+    return {
+        "type": "purchase_order" if "purchase" in raw_type else "invoice",
+        "supplier": str(data.get("supplier") or ""),
+        "number": str(data.get("number") or ""),
+        "issue_date": str(data.get("issue_date") or ""),
+        "due_date": str(data.get("due_date") or ""),
+        "currency": str(data.get("currency") or "").upper(),
+        "subtotal": to_float(data.get("subtotal")),
+        "tax": to_float(data.get("tax")),
+        "total": to_float(data.get("total")),
+        "status": "uploaded",
+        "source_filename": filename,
+    }, items
+
+
+def parse_image(
+    file,
+    filename: str,
+    api_key: str,
+    on_status=None,
+) -> tuple[dict, list[dict]]:
+    """Image -> structured doc.
+
+    Tries fast OCR + regex first; if core fields are still missing, falls back
+    to a vision LLM with a JSON-extraction prompt. on_status (optional) is
+    invoked with short status strings the UI can render.
+    """
+    notify = on_status or (lambda _: None)
     if not api_key:
         raise ValueError(
             "OpenRouter API key is not configured. "
@@ -255,35 +362,29 @@ def parse_image(file, filename: str, api_key: str) -> tuple[dict, list[dict]]:
 
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "png"
     mime = _MIME_BY_EXT.get(ext, "image/png")
-    data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
 
-    resp = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": OPENROUTER_OCR_MODEL,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "Extract every line of visible text from this image, "
-                            "exactly as written, one per line. "
-                            "Do not add commentary, headers, or formatting."
-                        ),
-                    },
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }],
-        },
-        timeout=60,
-    )
-    resp.raise_for_status()
-    text = resp.json()["choices"][0]["message"]["content"] or ""
-    if not text.strip():
-        raise ValueError("OCR returned no text")
-    return _parse_minimal_text(text, filename)
+    # 1) Fast / free OCR + regex
+    notify(f"Running fast OCR ({OPENROUTER_OCR_MODEL})…")
+    text = _call_openrouter_vision(OPENROUTER_OCR_MODEL, image_bytes, mime,
+                                   _OCR_PROMPT, api_key)
+    basic = None
+    if text.strip():
+        basic = _parse_minimal_text(text, filename)
+        if not _is_extraction_incomplete(basic[0]):
+            return basic
+
+    # 2) Fall back to vision LLM with structured JSON output
+    notify(f"Image looks complex — falling back to {OPENROUTER_VISION_MODEL}…")
+    try:
+        json_text = _call_openrouter_vision(
+            OPENROUTER_VISION_MODEL, image_bytes, mime,
+            _JSON_EXTRACT_PROMPT, api_key, want_json=True,
+        )
+        data = json.loads(_strip_json_fences(json_text))
+        return _doc_from_json(data, filename)
+    except (requests.HTTPError, json.JSONDecodeError, KeyError) as e:
+        # Graceful degradation: keep whatever the cheap path produced.
+        if basic is not None:
+            notify(f"Vision fallback failed ({e}); using fast-path result.")
+            return basic
+        raise ValueError(f"OCR failed and vision fallback errored: {e}") from e

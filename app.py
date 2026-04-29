@@ -81,16 +81,22 @@ def render_upload_tab() -> None:
 
     is_image = uploaded.name.lower().rsplit(".", 1)[-1] in ("png", "jpg", "jpeg")
     api_key = st.secrets.get("openrouter_key", "")
+    status_slot = st.empty()
     try:
         if is_image:
-            with st.spinner("Running OCR via OpenRouter…"):
-                doc, items = parse_file(uploaded, uploaded.name, api_key=api_key)
+            with st.spinner("Processing image…"):
+                doc, items = parse_file(
+                    uploaded, uploaded.name, api_key=api_key,
+                    on_status=lambda m: status_slot.info(m),
+                )
         else:
             doc, items = parse_file(uploaded, uploaded.name)
     except ValueError as e:
+        status_slot.empty()
         st.error(f"Could not parse `{uploaded.name}`: {e}")
         return
     except Exception as e:
+        status_slot.empty()
         st.error(f"Could not read `{uploaded.name}`: {e}")
         return
 
