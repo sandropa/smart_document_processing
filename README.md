@@ -1,2 +1,3 @@
-# smart_document_processing
+# Smart document processing
+
 A project that demonstrates smart document processing
