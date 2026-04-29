@@ -1,13 +1,22 @@
 """Document parsers."""
+import base64
 import re
 
 import pandas as pd
 import pypdf
+import requests
 
 from db import to_float
 
+IMAGE_EXTS = ("png", "jpg", "jpeg")
+OPENROUTER_OCR_MODEL = "baidu/qianfan-ocr-fast:free"
 
-def parse_file(file, filename: str) -> tuple[dict, list[dict]]:
+
+def parse_file(
+    file,
+    filename: str,
+    api_key: str | None = None,
+) -> tuple[dict, list[dict]]:
     """Dispatch to the right parser by filename extension."""
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
     if ext == "csv":
@@ -16,6 +25,8 @@ def parse_file(file, filename: str) -> tuple[dict, list[dict]]:
         return parse_pdf(file, filename)
     if ext == "txt":
         return parse_txt(file, filename)
+    if ext in IMAGE_EXTS:
+        return parse_image(file, filename, api_key or "")
     raise ValueError(f"Unsupported file type: .{ext}")
 
 # Canonical column name -> accepted header variants (lowercased + stripped).
@@ -162,40 +173,39 @@ def parse_pdf(file, filename: str) -> tuple[dict, list[dict]]:
     }, items
 
 
-# --- TXT parser (matches our minimal sample format) ---
+# --- Minimal text parser (TXT files + OCR output from images) ---
 
-_TXT_HEADER_RE = re.compile(r"^(invoice|purchase\s+order)\s+(.+)$", re.I)
-_TXT_TOTAL_RE = re.compile(r"^total\s*:\s*([\d.,]+)\s+(\w+)\s*$", re.I)
+_HEADER_RE = re.compile(r"^\s*(invoice|purchase\s+order)\s*:?\s*(.+)$", re.I)
+_SUPPLIER_RE = re.compile(r"^\s*supplier\s*:?\s*(.+)$", re.I)
+_TOTAL_RE = re.compile(r"^\s*total\s*:?\s*([\d.,]+)\s+(\w+)\s*$", re.I)
 
 
-def parse_txt(file, filename: str) -> tuple[dict, list[dict]]:
-    """Parse 'Invoice X' / 'Total: <amt> <ccy>' style files. No line items."""
-    if hasattr(file, "read"):
-        raw = file.read()
-        content = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
-    else:
-        with open(file, encoding="utf-8") as f:
-            content = f.read()
-
-    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+def _parse_minimal_text(content: str, filename: str) -> tuple[dict, list[dict]]:
+    """Parse 'Invoice X' / optional 'Supplier Y' / 'Total: Z CCY' style text."""
+    # Strip common bullet/list prefixes that an LLM might add.
+    lines = [
+        re.sub(r"^[-*•\s]+", "", ln).strip()
+        for ln in content.splitlines()
+        if ln.strip()
+    ]
     if not lines:
-        raise ValueError("TXT has no content")
+        raise ValueError("No text content")
 
-    doc_type, number = "invoice", ""
-    if m := _TXT_HEADER_RE.match(lines[0]):
-        doc_type = "purchase_order" if "purchase" in m.group(1).lower() else "invoice"
-        number = m.group(2).strip()
-
+    doc_type, number, supplier = "invoice", "", ""
     total, currency = 0.0, ""
-    for line in lines[1:]:
-        if m := _TXT_TOTAL_RE.match(line):
+    for line in lines:
+        if m := _HEADER_RE.match(line):
+            doc_type = "purchase_order" if "purchase" in m.group(1).lower() else "invoice"
+            number = m.group(2).strip()
+        elif m := _SUPPLIER_RE.match(line):
+            supplier = m.group(1).strip()
+        elif m := _TOTAL_RE.match(line):
             total = to_float(m.group(1).replace(",", ""))
             currency = m.group(2).upper()
-            break
 
     return {
         "type": doc_type,
-        "supplier": "",
+        "supplier": supplier,
         "number": number,
         "issue_date": "",
         "due_date": "",
@@ -207,3 +217,73 @@ def parse_txt(file, filename: str) -> tuple[dict, list[dict]]:
         "status": "uploaded",
         "source_filename": filename,
     }, []
+
+
+def parse_txt(file, filename: str) -> tuple[dict, list[dict]]:
+    """Parse 'Invoice X' / optional 'Supplier Y' / 'Total: <amt> <ccy>'."""
+    if hasattr(file, "read"):
+        raw = file.read()
+        content = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    else:
+        with open(file, encoding="utf-8") as f:
+            content = f.read()
+    if not content.strip():
+        raise ValueError("TXT has no content")
+    return _parse_minimal_text(content, filename)
+
+
+# --- Image parser via OpenRouter OCR ---
+
+_MIME_BY_EXT = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
+
+
+def parse_image(file, filename: str, api_key: str) -> tuple[dict, list[dict]]:
+    """Send the image to OpenRouter for OCR, then parse the returned text."""
+    if not api_key:
+        raise ValueError(
+            "OpenRouter API key is not configured. "
+            "Set 'openrouter_key' in Streamlit secrets."
+        )
+
+    if hasattr(file, "read"):
+        image_bytes = file.read()
+    else:
+        with open(file, "rb") as f:
+            image_bytes = f.read()
+    if not isinstance(image_bytes, (bytes, bytearray)):
+        raise ValueError("Could not read image bytes")
+
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "png"
+    mime = _MIME_BY_EXT.get(ext, "image/png")
+    data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
+
+    resp = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": OPENROUTER_OCR_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Extract every line of visible text from this image, "
+                            "exactly as written, one per line. "
+                            "Do not add commentary, headers, or formatting."
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }],
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    text = resp.json()["choices"][0]["message"]["content"] or ""
+    if not text.strip():
+        raise ValueError("OCR returned no text")
+    return _parse_minimal_text(text, filename)

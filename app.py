@@ -71,12 +71,22 @@ def render_upload_tab() -> None:
         return
 
     key = f"uploader_{st.session_state.get('uploader_key', 0)}"
-    uploaded = st.file_uploader("Upload a CSV, PDF, or TXT", type=["csv", "pdf", "txt"], key=key)
+    uploaded = st.file_uploader(
+        "Upload a CSV, PDF, TXT, or image",
+        type=["csv", "pdf", "txt", "png", "jpg", "jpeg"],
+        key=key,
+    )
     if uploaded is None:
         return
 
+    is_image = uploaded.name.lower().rsplit(".", 1)[-1] in ("png", "jpg", "jpeg")
+    api_key = st.secrets.get("openrouter_key", "")
     try:
-        doc, items = parse_file(uploaded, uploaded.name)
+        if is_image:
+            with st.spinner("Running OCR via OpenRouter…"):
+                doc, items = parse_file(uploaded, uploaded.name, api_key=api_key)
+        else:
+            doc, items = parse_file(uploaded, uploaded.name)
     except ValueError as e:
         st.error(f"Could not parse `{uploaded.name}`: {e}")
         return
