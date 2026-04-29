@@ -102,6 +102,22 @@ def list_documents() -> pd.DataFrame:
         )
 
 
+def existing_numbers(exclude_id: int | None = None) -> set[str]:
+    """Return non-blank document numbers, optionally excluding one id."""
+    with _connect() as conn:
+        if exclude_id is None:
+            rows = conn.execute(
+                "SELECT number FROM documents WHERE number IS NOT NULL AND number != ''"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT number FROM documents "
+                "WHERE number IS NOT NULL AND number != '' AND id != ?",
+                (exclude_id,),
+            ).fetchall()
+        return {r["number"] for r in rows}
+
+
 def get_document(doc_id: int) -> dict | None:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()

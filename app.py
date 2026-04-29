@@ -6,6 +6,7 @@ from auth import require_password
 from db import (
     DOC_TYPES,
     STATUSES,
+    existing_numbers,
     get_document,
     init_db,
     insert_document,
@@ -26,10 +27,13 @@ def _docs_with_issue_counts() -> pd.DataFrame:
     docs = list_documents()
     if docs.empty:
         return docs
+    all_numbers = existing_numbers()
     counts = []
     for doc_id in docs["id"]:
         full = get_document(int(doc_id))
-        issues = validate(full, full["items"]) if full else []
+        own = (full.get("number") or "").strip() if full else ""
+        others = all_numbers - ({own} if own else set())
+        issues = validate(full, full["items"], others) if full else []
         counts.append(sum(1 for i in issues if i["severity"] == "error"))
     docs.insert(len(docs.columns) - 1, "issues", counts)
     return docs
@@ -83,7 +87,7 @@ def render_upload_tab() -> None:
     st.json(doc)
     st.dataframe(pd.DataFrame(items), use_container_width=True)
 
-    issues = validate(doc, items)
+    issues = validate(doc, items, existing_numbers())
     st.write("**Validation**")
     render_issues(issues)
 
@@ -173,7 +177,7 @@ def render_detail_tab() -> None:
 
     # Read form values whether or not a button was clicked (initial render uses DB state).
     new_items = items_df.to_dict(orient="records")
-    issues = validate(doc, new_items)
+    issues = validate(doc, new_items, existing_numbers(exclude_id=selected))
 
     if save_clicked:
         if doc["status"] != "rejected":
