@@ -7,6 +7,7 @@ import pandas as pd
 DB_PATH = Path(__file__).parent / "data.db"
 STATUSES = ["uploaded", "needs_review", "validated", "rejected"]
 DOC_TYPES = ["invoice", "purchase_order"]
+CURRENCIES = ["EUR", "USD", "GBP", "CHF", "JPY", "CNY", "CAD", "AUD", "BAM", "SEK"]
 
 
 def to_float(x) -> float:

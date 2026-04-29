@@ -4,6 +4,7 @@ import streamlit as st
 
 from auth import require_password
 from db import (
+    CURRENCIES,
     DOC_TYPES,
     STATUSES,
     existing_numbers,
@@ -152,7 +153,14 @@ def render_detail_tab() -> None:
         with c2:
             doc["issue_date"] = st.text_input("Issue date", doc["issue_date"] or "")
             doc["due_date"] = st.text_input("Due date", doc["due_date"] or "")
-            doc["currency"] = st.text_input("Currency", doc["currency"] or "")
+            currency_options = ["", *CURRENCIES]
+            # Preserve unknown currency values that came from elsewhere (e.g. legacy uploads).
+            if doc["currency"] and doc["currency"] not in currency_options:
+                currency_options.append(doc["currency"])
+            doc["currency"] = st.selectbox(
+                "Currency", currency_options,
+                index=currency_options.index(doc["currency"]) if doc["currency"] in currency_options else 0,
+            )
         with c3:
             doc["subtotal"] = st.number_input("Subtotal", value=to_float(doc["subtotal"]))
             doc["tax"] = st.number_input("Tax", value=to_float(doc["tax"]))
